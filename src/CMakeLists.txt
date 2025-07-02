@@ -1,3 +1,4 @@
+include(CheckIncludeFile)
 
 configure_file(cmark_version.h.in
   ${CMAKE_CURRENT_BINARY_DIR}/cmark_version.h)
@@ -46,6 +47,11 @@ target_include_directories(cmark INTERFACE
 
 generate_export_header(cmark
   BASE_NAME ${PROJECT_NAME})
+
+check_include_file(sys/select.h HAVE_SYS_SELECT_H)
+if(HAVE_SYS_SELECT_H)
+add_compile_definitions(HAVE_SYS_SELECT_H)
+endif()
 
 # FIXME(compnerd) this should be removed, but exists solely to allow a migration
 # path for OSS Fuzz.

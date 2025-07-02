@@ -3,6 +3,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#ifdef HAVE_SYS_SELECT_H
+#include <sys/select.h>
+#else
+#include <sys/time.h>
+#endif
 
 #include "cmark_ctype.h"
 #include "cmark.h"
@@ -24,6 +30,110 @@ static inline void cr(cmark_strbuf *html) {
   if (html->size && html->ptr[html->size - 1] != '\n')
     cmark_strbuf_putc(html, '\n');
 }
+
+static inline void colorize_source(cmark_strbuf *dest, const unsigned char *source, bufsize_t length, const unsigned char *language) {
+  // CMARKCOLORIZER=pygmentize -O bg=light -l %l -f html
+  int inpipe[2], outpipe[2];
+
+  if (pipe(inpipe)) { perror("pipe"); return; }
+  if (pipe(outpipe)) { perror("pipe"); return; }
+
+  if (0 == fork()) {
+    // child
+    const char *colorizer_env = getenv("CMARKCOLORIZER");
+    if (colorizer_env == NULL || colorizer_env[0] == 0) {
+      // safety fallback??
+      colorizer_env = "cat";
+    }
+
+    const char *colorizer = "";
+    {
+      char *l_format = strstr(colorizer_env, "%l");
+      if (l_format && (l_format == colorizer_env || *(l_format-1) != '\\')) {
+        // replace %l
+        // TODO: if %l is escaped we should remove the backslash...
+        // XXX: do we need to shquot?? yes for pygmentize...
+        colorizer = calloc((strlen(colorizer_env) + (language != NULL ? strlen((const char *)language) : 0) + 1), sizeof(char));
+        // TODO: check for NULL
+
+        char *p = (char *)colorizer;
+        strncpy(p, colorizer_env, (l_format - colorizer_env));
+        p[strlen(p)] = '\'';
+        p[strlen(p)+1] = '\0';
+        if (language != NULL) {
+          strcat(p, (const char *)language);
+        }
+        p[strlen(p)] = '\'';
+        p[strlen(p)+1] = '\0';
+        strcat(p, (l_format + 2));
+      } else {
+        // XXX: this is a bit ugly because this is not a malloced string. We cannot free it unlike the if case. But this probably doesn't matter because we never free() in this process anyway??
+        colorizer = colorizer_env;
+      }
+    }
+
+    printf("%s\n", colorizer);
+
+    dup2(inpipe[0], 0/*fileno(stdin)*/);
+    dup2(outpipe[1], 1/*fileno(stdout)*/);
+    close(inpipe[0]);
+    close(inpipe[1]);
+    close(outpipe[0]);
+    close(outpipe[1]);
+    (void)execlp("sh", "sh", "-c", colorizer, NULL);
+    perror("execlp");
+  } else {
+    close(inpipe[0]);
+    close(outpipe[1]);
+
+    bufsize_t p = 0;
+    char buffer[BUFFER_SIZE];
+    int nfds = (outpipe[0] > inpipe[1] ? outpipe[0] : inpipe[1]) + 1;
+
+    fd_set readfds, writefds;
+    FD_ZERO(&readfds);
+    FD_ZERO(&writefds);
+
+    do {
+      FD_SET(outpipe[0], &readfds);
+      if (p < length) {
+        FD_SET(inpipe[1], &writefds);
+      }
+
+      int s = select(nfds, &readfds, &writefds, NULL, NULL);
+      if (s == 0) { continue; }
+      if (s < 0) { perror("select"); }
+
+      if (FD_ISSET(outpipe[0], &readfds)) {
+        // read output
+        ssize_t bytes_read = read(outpipe[0], &buffer, BUFFER_SIZE);
+        if (0 < bytes_read) {
+          cmark_strbuf_put(dest, (const unsigned char *)&buffer, bytes_read);
+        } else if (0 == bytes_read) {
+          // EOF
+          break;
+        } else {
+          perror("read");
+        }
+      }
+
+      if (FD_ISSET(inpipe[1], &writefds)) {
+        // send input
+        if (p < length) {
+          ssize_t n = write(inpipe[1], (source+p), (length-p));
+          if (n > 0) { p += n; }
+        }
+        if (p >= length) {
+          // all input sent, remove fd from select set
+          FD_CLR(inpipe[1], &writefds);
+          //fsync(inpipe[1]);
+          close(inpipe[1]);
+        }
+      }
+    } while (1);
+  }
+}
+
 
 struct render_state {
   cmark_strbuf *html;
@@ -147,6 +257,9 @@ static int S_render_node(cmark_node *node, cmark_event_type ev_type,
   case CMARK_NODE_CODE_BLOCK:
     cr(html);
 
+    if (NULL != getenv("CMARKCOLORIZER")) {
+        colorize_source(html, node->data, node->len, node->as.code.info);
+    } else {
     if (node->as.code.info == NULL || node->as.code.info[0] == 0) {
       cmark_strbuf_puts(html, "<pre");
       S_render_sourcepos(node, html, options);
@@ -170,6 +283,7 @@ static int S_render_node(cmark_node *node, cmark_event_type ev_type,
 
     escape_html(html, node->data, node->len);
     cmark_strbuf_puts(html, "</code></pre>\n");
+    }
     break;
 
   case CMARK_NODE_HTML_BLOCK:
@@ -240,6 +354,7 @@ static int S_render_node(cmark_node *node, cmark_event_type ev_type,
 
   case CMARK_NODE_CODE:
     cmark_strbuf_puts(html, "<code>");
+// TODO: implement COLORIZER here too?
     escape_html(html, node->data, node->len);
     cmark_strbuf_puts(html, "</code>");
     break;
